@@ -55,7 +55,7 @@ on:
         description: '是否启用Droidspaces容器支持(轻量化的完整Linux容器支持;false关闭,standard开启容器+ntsync支持,extend开启更多测试支持项)'
         required: true
         type: choice
-        default: 'false'
+        default: 'standard'
         options:
           - 'false'
           - 'standard'
@@ -95,6 +95,11 @@ on:
         required: false
         type: string
         default: 'android16-5-gf1bdb13583da-ab13761046-4k'
+      nomount_commit:
+        description: 'NoMount commit SHA to pin (empty = latest upstream)'
+        required: false
+        type: string
+        default: 'dev'
 
 jobs:
   build:
@@ -102,6 +107,7 @@ jobs:
     outputs:
       ksuver: ${{ steps.ksu_version.outputs.ksuver }}
       ak3name: ${{ steps.create_zip.outputs.ak3name }}
+      nomount_commit: ${{ steps.apply_nomount.outputs.nomount_commit }}
     permissions:
       actions: write
       contents: read
@@ -563,6 +569,83 @@ jobs:
           sed -i 's/${scm_version}//' ./common/scripts/setlocalversion
           echo "CONFIG_LOCALVERSION_AUTO=n" >> ./common/arch/arm64/configs/gki_defconfig
            
+      - name: 应用 NoMount 内核集成
+        id: apply_nomount
+        env:
+          NOMOUNT_TARGET: ${{ inputs.nomount_commit }}
+        run: |
+          set -euo pipefail
+          cd kernel_workspace
+          git clone --no-checkout --depth 1 https://github.com/maxsteeel/nomount.git nomount
+
+          if [[ -n "$NOMOUNT_TARGET" ]]; then
+            if [[ "$NOMOUNT_TARGET" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              echo "正在检出指定的 NoMount 提交：$NOMOUNT_TARGET"
+              NOMOUNT_TARGET="${NOMOUNT_TARGET,,}"
+              git -C nomount fetch --depth 1 origin "$NOMOUNT_TARGET"
+              NOMOUNT_REF_SOURCE="explicit commit SHA"
+            else
+              if ! git check-ref-format --branch "$NOMOUNT_TARGET" >/dev/null; then
+                echo "::error::nomount_commit must be a full commit SHA or valid branch name"
+                exit 1
+              fi
+              echo "正在检出指定的 NoMount 分支：$NOMOUNT_TARGET"
+              git -C nomount fetch --depth 1 origin "refs/heads/$NOMOUNT_TARGET"
+              NOMOUNT_REF_SOURCE="branch $NOMOUNT_TARGET"
+            fi
+            git -C nomount checkout --detach FETCH_HEAD
+            NOMOUNT_COMMIT_SHA="$(git -C nomount rev-parse HEAD)"
+            if [[ "$NOMOUNT_TARGET" =~ ^[0-9a-f]{40}$ ]] && [[ "$NOMOUNT_COMMIT_SHA" != "$NOMOUNT_TARGET" ]]; then
+              echo "::error::NoMount checkout mismatch: wanted $NOMOUNT_TARGET, got $NOMOUNT_COMMIT_SHA"
+              exit 1
+            fi
+          else
+            git -C nomount checkout --detach origin/HEAD 2>/dev/null || git -C nomount checkout --detach
+            NOMOUNT_COMMIT_SHA="$(git -C nomount rev-parse HEAD)"
+            NOMOUNT_REF_SOURCE="upstream latest"
+            echo "::warning::No nomount_commit provided; using upstream latest ($NOMOUNT_COMMIT_SHA)"
+          fi
+          git -C nomount log --oneline -1
+
+          NOMOUNT_SOURCE="nomount/kernel/src"
+          NOMOUNT_DEST="common/fs/nomount"
+          [[ -d "$NOMOUNT_SOURCE" ]] || { echo "::error::NoMount kernel/src directory missing"; exit 1; }
+          rm -rf "$NOMOUNT_DEST"
+          mkdir -p "$NOMOUNT_DEST"
+          cp -a "$NOMOUNT_SOURCE"/. "$NOMOUNT_DEST"/
+          for file in nomount.c nomount.h Kconfig Makefile; do
+            [[ -f "$NOMOUNT_DEST/$file" ]] || { echo "::error::$NOMOUNT_DEST/$file missing after copy"; exit 1; }
+          done
+
+          if ! grep -qF 'obj-$(CONFIG_NOMOUNT) += nomount/' common/fs/Makefile; then
+            printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> common/fs/Makefile
+          fi
+          if ! grep -qF 'source "fs/nomount/Kconfig"' common/fs/Kconfig; then
+            awk '
+              /^endmenu/ { last_match = NR }
+              { lines[NR] = $0 }
+              END {
+                if (!last_match) exit 1
+                for (i = 1; i <= NR; i++) {
+                  if (i == last_match) print "source \"fs/nomount/Kconfig\""
+                  print lines[i]
+                }
+              }
+            ' common/fs/Kconfig > common/fs/Kconfig.tmp \
+              && mv common/fs/Kconfig.tmp common/fs/Kconfig \
+              || { echo "::error::Could not wire NoMount into common/fs/Kconfig"; exit 1; }
+          fi
+          grep -q '^CONFIG_NOMOUNT=y$' common/arch/arm64/configs/gki_defconfig \
+            || printf '%s\n' 'CONFIG_NOMOUNT=y' >> common/arch/arm64/configs/gki_defconfig
+
+          grep -qF 'obj-$(CONFIG_NOMOUNT) += nomount/' common/fs/Makefile
+          grep -qF 'source "fs/nomount/Kconfig"' common/fs/Kconfig
+          grep -q '^CONFIG_NOMOUNT=y$' common/arch/arm64/configs/gki_defconfig
+          echo "nomount_commit=$NOMOUNT_COMMIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "NOMOUNT_COMMIT_SHA=$NOMOUNT_COMMIT_SHA" >> "$GITHUB_ENV"
+          echo "NOMOUNT_REF_SOURCE=$NOMOUNT_REF_SOURCE" >> "$GITHUB_ENV"
+          echo "✅ NoMount integrated from commit $NOMOUNT_COMMIT_SHA ($NOMOUNT_REF_SOURCE)"
+
       - name: 构建内核
         run: |
           WORKDIR="$(pwd)"
@@ -767,6 +850,7 @@ jobs:
           echo "Kernel Ver: $FULL_VERSION" >> ./ak3.log
           echo "KSU Branch: ${KSU_TYPENAME}" >> ./ak3.log
           echo "KSU Ver: ${KSUVER}" >> ./ak3.log
+          echo "NoMount Commit: ${NOMOUNT_COMMIT_SHA}" >> ./ak3.log
           echo "susfs: ${{ github.event.inputs.susfs_enable }}" >> ./ak3.log
           echo "KPM: ${{ github.event.inputs.kpm_enable }}" >> ./ak3.log
           echo "LZ4: ${{ github.event.inputs.lz4_enable }}" >> ./ak3.log
@@ -851,6 +935,7 @@ jobs:
           - 编译时间: ${{ env.TIME_FORM }}
           - 机型：欧加真骁龙8E Gen5通用 ${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }} 内核（基于一加15 ${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }} 版官方源码）
           - KSU分支：${{ env.KSU_TYPENAME }}
+          - NoMount commit：${{ needs.build.outputs.nomount_commit }}
           - susfs支持：${{ github.event.inputs.susfs_enable }}
           - KPM支持 ：${{ github.event.inputs.kpm_enable }}
           - LZ4支持：${{ github.event.inputs.lz4_enable }}
