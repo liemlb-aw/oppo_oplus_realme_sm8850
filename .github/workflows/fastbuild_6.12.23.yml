@@ -7,6 +7,9 @@ env:
   SUB_VERSION: '23'
   KERNEL_NAME: 'android16-5-ga8f88ad96df3-ab13929693-4k'
   CCACHE_KEY: ccache-ecsv4-6.12.23
+  KERNEL_COMMIT: '1fdec1073c8fa24282dcbe8395593759c2ce0d17'
+  SUKISU_COMMIT: '56d45a19193a41bf42c8db655c9d2cfba44c48f1'
+  SUSFS_COMMIT: '5f236a7b573c5a21ad0e5871ee96b63b89486596'
 
 on:
   workflow_dispatch:
@@ -136,9 +139,9 @@ jobs:
           rm -f ./ccache &
           
           echo "正在克隆源码仓库..."
-          aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8850/archive/refs/heads/oneplus/sm8850_v_16.0.0_oneplus_15.zip -o common.zip && 
+          aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8850/archive/${{ env.KERNEL_COMMIT }}.zip -o common.zip && 
           unzip -q common.zip && 
-          mv "android_kernel_common_oneplus_sm8850-oneplus-sm8850_v_16.0.0_oneplus_15" common &&
+          mv "android_kernel_common_oneplus_sm8850-${{ env.KERNEL_COMMIT }}" common &&
           rm -rf common.zip &
           
           echo "正在克隆llvm-clang19工具链..." &&
@@ -178,6 +181,9 @@ jobs:
           else
             CCACHE_REAL_KEY=${{ env.CCACHE_KEY }}-none
           fi
+          if [[ "${{ inputs.ksu_type }}" == "sukisu" && "${{ inputs.susfs_enable }}" == "true" ]]; then
+            CCACHE_REAL_KEY+="-sukisu-susfs-56d45a1-5f236a7-v1"
+          fi
           echo "CCACHE_REAL_KEY=$CCACHE_REAL_KEY" >> $GITHUB_ENV
 
       - name: 载入当前版本内核的 ccache缓存
@@ -194,6 +200,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          if [[ "${{ inputs.ksu_type }}" == "sukisu" && "${{ inputs.susfs_enable }}" == "true" ]]; then
+            echo "Skipping incompatible public ccache for the pinned SukiSU/SUSFS integration"
+            exit 0
+          fi
           echo "检查本地缓存状态..."
           if [ -d "${{ env.CCACHE_DIR }}" ] && [ "$(ls -A ${{ env.CCACHE_DIR }} 2>/dev/null)" ]; then
             echo "检测到本地已成功载入 ccache 缓存，跳过公共 ccache 拉取！"
@@ -267,7 +277,7 @@ jobs:
             trap 'rm -f "$SUKISU_SETUP_SCRIPT"' EXIT
             if ! curl --fail --location --proto '=https' --tlsv1.2 -LSs \
               --retry 5 --retry-delay 5 --retry-all-errors \
-              "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
+              "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/${{ env.SUKISU_COMMIT }}/kernel/setup.sh" \
               -o "$SUKISU_SETUP_SCRIPT"; then
               echo "::error::Failed to download SukiSU Ultra setup.sh"
               exit 1
@@ -277,12 +287,17 @@ jobs:
               echo "::error::Downloaded SukiSU setup.sh is invalid (${SCRIPT_SIZE} bytes)"
               exit 1
             fi
-            bash "$SUKISU_SETUP_SCRIPT"
+            bash "$SUKISU_SETUP_SCRIPT" "${{ env.SUKISU_COMMIT }}"
             KSU_REPO_DIR="$(pwd)/KernelSU"
             KSU_KDIR="$KSU_REPO_DIR/kernel"
             [[ -d "$KSU_KDIR" ]] || { echo "::error::SukiSU setup did not create KernelSU/kernel"; exit 1; }
             [[ -f "$KSU_KDIR/Kbuild" ]] || { echo "::error::SukiSU Kbuild file missing"; exit 1; }
+            [[ "$(git -C "$KSU_REPO_DIR" rev-parse HEAD)" == "${{ env.SUKISU_COMMIT }}" ]] \
+              || { echo "::error::SukiSU checkout does not match the integration baseline"; exit 1; }
+            [[ "$(realpath common/drivers/kernelsu)" == "$KSU_KDIR" ]] \
+              || { echo "::error::The kernel does not reference the expected SukiSU source"; exit 1; }
 
+            if [[ "${{ inputs.susfs_enable }}" != "true" ]]; then
             if [[ -d "$KSU_KDIR/include" ]]; then
               cp -f "$KSU_KDIR/include/"*.h "$KSU_KDIR/" 2>/dev/null || true
               printf '\nccflags-y += -I%s -I%s/include\n' "$KSU_KDIR" "$KSU_KDIR" >> "$KSU_KDIR/Kbuild"
@@ -305,10 +320,12 @@ jobs:
             while IFS= read -r source; do
               sed -i '1i #include <linux/types.h>' "$source"
             done < <(grep -rlwE 'allow_shell|ksu_late_loaded|ksu_no_custom_rc' "$KSU_KDIR" --include='*.c' 2>/dev/null || true)
+            fi
 
             KSU_COMMIT_SHA="$(git -C "$KSU_REPO_DIR" rev-parse HEAD)"
             COMMITS_COUNT="$(git -C "$KSU_REPO_DIR" rev-list --count HEAD)"
             KSU_VERSION=$((COMMITS_COUNT + 37185))
+            if [[ "${{ inputs.susfs_enable }}" != "true" ]]; then
             sed -i "s/DKSU_VERSION=[0-9]*/DKSU_VERSION=${KSU_VERSION}/" "$KSU_KDIR/Makefile" || true
             sed -i 's#^KSU_VERSION_FULL :=.*#KSU_VERSION_FULL := v$(VERSION_TAG)-⚡Ultra⚡@SukiSU#' "$KSU_KDIR/Kbuild" || true
 
@@ -316,27 +333,11 @@ jobs:
             sed -i \
               -e 's|^KSU_KERNEL_DIR := $(srctree)/$(src)$|KSU_KERNEL_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))|' \
               -e 's|^KSU_KERNEL_DIR := $(src)$|KSU_KERNEL_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))|' \
+              -e 's|^REPO_BRANCH :=.*|REPO_BRANCH := HEAD|' \
+              -e 's|^KSU_GITHUB_VER   :=.*|KSU_GITHUB_VER   :=|' \
+              -e 's|^GITHUB_COMMITS   :=.*|GITHUB_COMMITS   :=|' \
               "$KSU_KDIR/Kbuild"
-            python3 - "$KSU_KDIR/Kbuild" <<'PY'
-          import pathlib
-          import sys
-
-          path = pathlib.Path(sys.argv[1])
-          lines = path.read_text().splitlines()
-          replacements = {
-              "REPO_BRANCH :=": "REPO_BRANCH := HEAD",
-              "KSU_GITHUB_VER   :=": "KSU_GITHUB_VER   :=",
-              "GITHUB_COMMITS   :=": "GITHUB_COMMITS   :=",
-          }
-          for prefix, replacement in replacements.items():
-              matches = [index for index, line in enumerate(lines) if line.startswith(prefix)]
-              if len(matches) != 1:
-                  raise SystemExit(
-                      f"Expected exactly one {prefix!r} assignment in {path}, found {len(matches)}"
-                  )
-              lines[matches[0]] = replacement
-          path.write_text("\n".join(lines) + "\n")
-          PY
+            fi
 
             DEFCONFIG="./common/arch/arm64/configs/gki_defconfig"
             sed -i -e '/^CONFIG_KSU=/d' -e '/^CONFIG_KPM=/d' -e '/^CONFIG_KSU_FULL_NAME_FORMAT=/d' "$DEFCONFIG"
@@ -386,15 +387,42 @@ jobs:
       - name: 应用 KernelSU & SUSFS 补丁
         if: inputs.susfs_enable
         run: |
+          set -euo pipefail
           cd kernel_workspace
           if [[ ${{ github.event.inputs.ksu_type }} != "none" ]]; then
             echo "正在添加susfs补丁..."
             git clone --depth=1 https://github.com/cctv18/susfs4oki.git susfs4ksu -b oki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
-            cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch ./common/
+            if [[ "${{ inputs.ksu_type }}" == "sukisu" ]]; then
+              git -C susfs4ksu fetch --depth 1 origin "${{ env.SUSFS_COMMIT }}"
+              git -C susfs4ksu checkout --detach FETCH_HEAD
+              [[ "$(git -C susfs4ksu rev-parse HEAD)" == "${{ env.SUSFS_COMMIT }}" ]]
+              for patch_file in sukisu_susfs_kernel.patch sukisu_susfs_full.patch; do
+                curl --fail --location --retry 5 --retry-all-errors \
+                  "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/other_patch/$patch_file" \
+                  -o "$patch_file"
+              done
+              git -C KernelSU apply --check "$(pwd)/sukisu_susfs_full.patch"
+              git -C KernelSU apply "$(pwd)/sukisu_susfs_full.patch"
+              cp KernelSU/uapi/*.h common/include/uapi/
+            else
+              cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch ./common/
+            fi
             cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
             cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
             cd ./common
-            patch -p1 -F 3 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
+            if [[ "${{ inputs.ksu_type }}" == "sukisu" ]]; then
+              git apply --check ../sukisu_susfs_kernel.patch
+              git apply ../sukisu_susfs_kernel.patch
+              grep -qF 'DEFINE_STATIC_KEY_TRUE(ksu_su_compat_enabled)' drivers/kernelsu/feature/sucompat.c
+              grep -qF 'susfs_init();' drivers/kernelsu/core/init.c
+              if grep -qE 'kernelsu-objs.*hook/(syscall|tp_marker|lsm_hook)' drivers/kernelsu/Kbuild; then
+                echo "::error::Duplicate syscall-hook machinery remains in the SUSFS build"
+                exit 1
+              fi
+              echo "Complete pinned SukiSU/SUSFS integration applied"
+            else
+              patch -p1 -F 3 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
+            fi
             cd ..
           else
             echo "已选择无内置KernelSU模式，跳过susfs配置..."
@@ -404,8 +432,10 @@ jobs:
             cp ./susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ./KernelSU/
             cd ./KernelSU
             patch -p1 -F 3 < 10_enable_susfs_for_ksu.patch || true
+            cd ..
           fi
-          
+
+
       - name: 应用lz4 1.10.0 & zstd 1.5.7补丁
         if: inputs.lz4_enable
         run: |
@@ -733,6 +763,7 @@ jobs:
 
       - name: 构建内核
         run: |
+          set -eo pipefail
           WORKDIR="$(pwd)"
           export PATH="/usr/lib/ccache:$PATH"
           export PATH="$WORKDIR/kernel_workspace/clang19/bin:$PATH"
@@ -741,14 +772,14 @@ jobs:
           export CLANG_DIR="$WORKDIR/kernel_workspace/clang19/bin"
           CLANG_VERSION="$($CLANG_DIR/clang --version | head -n 1)"
           LLD_VERSION="$($CLANG_DIR/ld.lld --version | head -n 1)"
-          RUSTC_VERSION="$(rustc -V 2>/dev/null | head -n1)"
-          BINDGEN_VERSION="$(bindgen --version 2>/dev/null | head -n1)"
+          RUSTC_VERSION="$(rustc -V 2>/dev/null | head -n1 || true)"
+          BINDGEN_VERSION="$(bindgen --version 2>/dev/null | head -n1 || true)"
           echo "编译器信息:"
           echo "Clang版本: $CLANG_VERSION"
           echo "LLD版本: $LLD_VERSION"
           echo "Rustc版本: $RUSTC_VERSION"
           echo "Bindgen版本: $BINDGEN_VERSION"
-          pahole_version=$(pahole --version 2>/dev/null | head -n1); [ -z "$pahole_version" ] && echo "pahole版本：未安装" || echo "pahole版本：$pahole_version"
+          pahole_version=$(pahole --version 2>/dev/null | head -n1 || true); [ -z "$pahole_version" ] && echo "pahole版本：未安装" || echo "pahole版本：$pahole_version"
           
           export CCACHE_LOGFILE="${{ github.workspace }}/kernel_workspace/ccache.log"
           export CCACHE_COMPILERCHECK="none"
@@ -840,8 +871,27 @@ jobs:
           sudo rm -rf /usr/local/lib/android &
           sudo rm -rf /opt/ghc &
           sudo rm -rf /opt/hostedtoolcache/CodeQL &
-          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="clang" LD="ld.lld" OBJCOPY="llvm-objcopy" O=out gki_defconfig &&
-          export CC="$(pwd)/cc-wrapper" && export LD="$(pwd)/ld-wrapper" &&
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="clang" LD="ld.lld" OBJCOPY="llvm-objcopy" O=out gki_defconfig
+          export CC="$(pwd)/cc-wrapper"
+          export LD="$(pwd)/ld-wrapper"
+          if [[ "${{ inputs.ksu_type }}" == "sukisu" && "${{ inputs.susfs_enable }}" == "true" ]]; then
+            grep -qx 'CONFIG_KSU=y' out/.config \
+              || { echo "::error::SukiSU must be built in (CONFIG_KSU=y)"; exit 1; }
+            grep -qx 'CONFIG_KSU_SUSFS=y' out/.config \
+              || { echo "::error::SUSFS Kconfig integration did not enable CONFIG_KSU_SUSFS"; exit 1; }
+            make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$CC" LD="$LD" OBJCOPY="llvm-objcopy" O=out security/selinux/
+            make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$CC" LD="$LD" OBJCOPY="llvm-objcopy" O=out drivers/kernelsu/
+            KSU_SYMBOLS="$(llvm-nm --defined-only out/drivers/kernelsu/built-in.a)"
+            for symbol in ksu_handle_faccessat ksu_handle_stat ksu_handle_execveat \
+              ksu_handle_execveat_sucompat ksu_handle_post_execveat_sucompat \
+              ksu_handle_sys_read ksu_handle_vfs_fstat ksu_handle_sys_reboot \
+              ksu_handle_setresuid ksu_is_init_rc_hook_enabled ksu_is_input_hook_enabled \
+              ksu_su_compat_enabled susfs_is_current_ksu_domain; do
+              grep -qE "[[:space:]][TDB][[:space:]]${symbol}$" <<< "$KSU_SYMBOLS" \
+                || { echo "::error::SukiSU built-in archive does not define $symbol"; exit 1; }
+            done
+            echo "Complete SukiSU SUSFS built-in interfaces verified before linking"
+          fi
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" OBJCOPY="llvm-objcopy" O=out Image
           
           # 编译后时间劫持二次校验
