@@ -261,8 +261,93 @@ jobs:
         run: |
           # 进入内核工作目录
           cd kernel_workspace
-          if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" || ${{ github.event.inputs.ksu_type }} == "bakasu" ]]; then
-            echo "正在配置BakaSU（由于SukiSU长期未维护无法正常编译，且BakaSU兼容sukisu管理器，故SukiSU源码仓库已重定向为bakasu）..."
+          if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" ]]; then
+            echo "正在配置SukiSU Ultra..."
+            SUKISU_SETUP_SCRIPT="$(mktemp /tmp/sukisu_setup_XXXXXX.sh)"
+            trap 'rm -f "$SUKISU_SETUP_SCRIPT"' EXIT
+            if ! curl --fail --location --proto '=https' --tlsv1.2 -LSs \
+              --retry 5 --retry-delay 5 --retry-all-errors \
+              "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
+              -o "$SUKISU_SETUP_SCRIPT"; then
+              echo "::error::Failed to download SukiSU Ultra setup.sh"
+              exit 1
+            fi
+            SCRIPT_SIZE="$(stat -c%s "$SUKISU_SETUP_SCRIPT")"
+            if [[ "$SCRIPT_SIZE" -lt 512 ]] || ! head -n1 "$SUKISU_SETUP_SCRIPT" | grep -q '^#!'; then
+              echo "::error::Downloaded SukiSU setup.sh is invalid (${SCRIPT_SIZE} bytes)"
+              exit 1
+            fi
+            bash "$SUKISU_SETUP_SCRIPT"
+            KSU_REPO_DIR="$(pwd)/KernelSU"
+            KSU_KDIR="$KSU_REPO_DIR/kernel"
+            [[ -d "$KSU_KDIR" ]] || { echo "::error::SukiSU setup did not create KernelSU/kernel"; exit 1; }
+            [[ -f "$KSU_KDIR/Kbuild" ]] || { echo "::error::SukiSU Kbuild file missing"; exit 1; }
+
+            if [[ -d "$KSU_KDIR/include" ]]; then
+              cp -f "$KSU_KDIR/include/"*.h "$KSU_KDIR/" 2>/dev/null || true
+              printf '\nccflags-y += -I%s -I%s/include\n' "$KSU_KDIR" "$KSU_KDIR" >> "$KSU_KDIR/Kbuild"
+              printf 'ccflags-y += -include linux/string.h -include %s/ksu.h\n' "$KSU_KDIR" >> "$KSU_KDIR/Kbuild"
+            fi
+            if [[ -d "$KSU_REPO_DIR/uapi" ]]; then
+              mkdir -p ./common/include/uapi
+              cp "$KSU_REPO_DIR/uapi/"*.h ./common/include/uapi/ 2>/dev/null || true
+            fi
+            _sukisu_inject_extern() {
+              local declaration="$1" symbol="$2" source
+              while IFS= read -r source; do
+                grep -qF "$declaration" "$source" || sed -i "1i $declaration" "$source"
+              done < <(grep -rlw "$symbol" "$KSU_KDIR" --include='*.c' 2>/dev/null || true)
+            }
+            _sukisu_inject_extern 'extern struct cred *ksu_cred;' 'ksu_cred'
+            _sukisu_inject_extern 'extern bool allow_shell;' 'allow_shell'
+            _sukisu_inject_extern 'extern bool ksu_late_loaded;' 'ksu_late_loaded'
+            _sukisu_inject_extern 'extern bool ksu_no_custom_rc;' 'ksu_no_custom_rc'
+            while IFS= read -r source; do
+              sed -i '1i #include <linux/types.h>' "$source"
+            done < <(grep -rlwE 'allow_shell|ksu_late_loaded|ksu_no_custom_rc' "$KSU_KDIR" --include='*.c' 2>/dev/null || true)
+
+            KSU_COMMIT_SHA="$(git -C "$KSU_REPO_DIR" rev-parse HEAD)"
+            COMMITS_COUNT="$(git -C "$KSU_REPO_DIR" rev-list --count HEAD)"
+            KSU_VERSION=$((COMMITS_COUNT + 37185))
+            sed -i "s/DKSU_VERSION=[0-9]*/DKSU_VERSION=${KSU_VERSION}/" "$KSU_KDIR/Makefile" || true
+            sed -i 's#^KSU_VERSION_FULL :=.*#KSU_VERSION_FULL := v$(VERSION_TAG)-⚡Ultra⚡@SukiSU#' "$KSU_KDIR/Kbuild" || true
+
+            # Keep KSU_KERNEL_DIR anchored to the real Kbuild location for 6.12 in-tree builds.
+            sed -i \
+              -e 's|^KSU_KERNEL_DIR := $(srctree)/$(src)$|KSU_KERNEL_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))|' \
+              -e 's|^KSU_KERNEL_DIR := $(src)$|KSU_KERNEL_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))|' \
+              "$KSU_KDIR/Kbuild"
+            python3 - "$KSU_KDIR/Kbuild" <<'PY'
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          lines = path.read_text().splitlines()
+          replacements = {
+              "REPO_BRANCH :=": "REPO_BRANCH := HEAD",
+              "KSU_GITHUB_VER   :=": "KSU_GITHUB_VER   :=",
+              "GITHUB_COMMITS   :=": "GITHUB_COMMITS   :=",
+          }
+          for prefix, replacement in replacements.items():
+              matches = [index for index, line in enumerate(lines) if line.startswith(prefix)]
+              if len(matches) != 1:
+                  raise SystemExit(
+                      f"Expected exactly one {prefix!r} assignment in {path}, found {len(matches)}"
+                  )
+              lines[matches[0]] = replacement
+          path.write_text("\n".join(lines) + "\n")
+          PY
+
+            DEFCONFIG="./common/arch/arm64/configs/gki_defconfig"
+            sed -i -e '/^CONFIG_KSU=/d' -e '/^CONFIG_KPM=/d' -e '/^CONFIG_KSU_FULL_NAME_FORMAT=/d' "$DEFCONFIG"
+            printf '%s\n' 'CONFIG_KSU=y' 'CONFIG_KPM=n' >> "$DEFCONFIG"
+            echo "KSUVER=$KSU_VERSION" >> "$GITHUB_ENV"
+            echo "ksuver=$KSU_VERSION" >> "$GITHUB_OUTPUT"
+            echo "KSU_COMMIT_SHA=$KSU_COMMIT_SHA" >> "$GITHUB_ENV"
+            echo "SukiSU Ultra commit: $KSU_COMMIT_SHA"
+            echo "SukiSU Ultra version: $KSU_VERSION"
+          elif [[ ${{ github.event.inputs.ksu_type }} == "bakasu" ]]; then
+            echo "正在配置BakaSU..."
             curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/refs/heads/main/kernel/setup.sh" | bash -s main
             echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@cctv18"' >> ./common/arch/arm64/configs/gki_defconfig
             cd ./KernelSU
