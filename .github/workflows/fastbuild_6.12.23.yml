@@ -7,8 +7,8 @@ env:
   SUB_VERSION: '23'
   KERNEL_NAME: 'android16-5-ga8f88ad96df3-ab13929693-4k'
   CCACHE_KEY: ccache-ecsv4-6.12.23
-  KERNEL_COMMIT: '1fdec1073c8fa24282dcbe8395593759c2ce0d17'
-  SUKISU_COMMIT: '56d45a19193a41bf42c8db655c9d2cfba44c48f1'
+  # KERNEL_COMMIT: '1fdec1073c8fa24282dcbe8395593759c2ce0d17'
+  # SUKISU_COMMIT: '56d45a19193a41bf42c8db655c9d2cfba44c48f1'
   SUSFS_COMMIT: '5f236a7b573c5a21ad0e5871ee96b63b89486596'
 
 on:
@@ -139,9 +139,9 @@ jobs:
           rm -f ./ccache &
           
           echo "正在克隆源码仓库..."
-          aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8850/archive/${{ env.KERNEL_COMMIT }}.zip -o common.zip && 
+          aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8850/archive/refs/heads/oneplus/sm8850_v_16.0.0_oneplus_15.zip -o common.zip && 
           unzip -q common.zip && 
-          mv "android_kernel_common_oneplus_sm8850-${{ env.KERNEL_COMMIT }}" common &&
+          mv "android_kernel_common_oneplus_sm8850-oneplus-sm8850_v_16.0.0_oneplus_15" common &&
           rm -rf common.zip &
           
           echo "正在克隆llvm-clang19工具链..." &&
@@ -277,7 +277,7 @@ jobs:
             trap 'rm -f "$SUKISU_SETUP_SCRIPT"' EXIT
             if ! curl --fail --location --proto '=https' --tlsv1.2 -LSs \
               --retry 5 --retry-delay 5 --retry-all-errors \
-              "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/${{ env.SUKISU_COMMIT }}/kernel/setup.sh" \
+              "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
               -o "$SUKISU_SETUP_SCRIPT"; then
               echo "::error::Failed to download SukiSU Ultra setup.sh"
               exit 1
@@ -287,13 +287,13 @@ jobs:
               echo "::error::Downloaded SukiSU setup.sh is invalid (${SCRIPT_SIZE} bytes)"
               exit 1
             fi
-            bash "$SUKISU_SETUP_SCRIPT" "${{ env.SUKISU_COMMIT }}"
+            bash "$SUKISU_SETUP_SCRIPT" main
             KSU_REPO_DIR="$(pwd)/KernelSU"
             KSU_KDIR="$KSU_REPO_DIR/kernel"
             [[ -d "$KSU_KDIR" ]] || { echo "::error::SukiSU setup did not create KernelSU/kernel"; exit 1; }
             [[ -f "$KSU_KDIR/Kbuild" ]] || { echo "::error::SukiSU Kbuild file missing"; exit 1; }
-            [[ "$(git -C "$KSU_REPO_DIR" rev-parse HEAD)" == "${{ env.SUKISU_COMMIT }}" ]] \
-              || { echo "::error::SukiSU checkout does not match the integration baseline"; exit 1; }
+            # [[ "$(git -C "$KSU_REPO_DIR" rev-parse HEAD)" == "${{ env.SUKISU_COMMIT }}" ]] \
+            #   || { echo "::error::SukiSU checkout does not match the integration baseline"; exit 1; }
             [[ "$(realpath common/drivers/kernelsu)" == "$KSU_KDIR" ]] \
               || { echo "::error::The kernel does not reference the expected SukiSU source"; exit 1; }
 
