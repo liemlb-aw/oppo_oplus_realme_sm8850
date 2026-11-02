@@ -2997,14 +2997,13 @@ index 90d14912cd09b3fd9da881b55117d5b7712ec8e5..e0116d95bcfb71e537f2279184595744
          free_module_rc();
      }
 diff --git a/kernel/selinux/rules.c b/kernel/selinux/rules.c
-index 768b9a261a769c5b147264913fd8e039d55e32a8..2595940b96cd50f62991393b67f800f724815691 100644
+index 241eeeb0ebc73e16eb941a0c29359ee5c5de2466..a85c04df864fdce721f60cfc6eb86d4226fa8958 100644
 --- a/kernel/selinux/rules.c
 +++ b/kernel/selinux/rules.c
-@@ -161,6 +161,8 @@ void apply_kernelsu_rules()
+@@ -162,6 +162,7 @@ void apply_kernelsu_rules()
      ksu_destroy_sepolicy(old_pol);
  
-     reset_avc_cache();
-+
+     reset_avc_cache(pol->latest_granting);
 +    susfs_set_batch_sid();
  out_unlock:
      mutex_unlock(&selinux_state.policy_mutex);
