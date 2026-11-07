@@ -25,6 +25,11 @@ on:
           - 'ksunext'
           - 'ksu'
           - 'none'
+      ksu_branch_or_hash:
+        description: 'KSU branch, tag, or full 40-character commit SHA (empty = default branch for selected type)'
+        required: false
+        type: string
+        default: ""
       susfs_enable:
         description: '是否开启susfs(用于增强隐藏环境挂载功能; 可能轻微增加耗电，上游更新导致不稳定时或不需要可关闭)'
         required: true
@@ -182,7 +187,10 @@ jobs:
             CCACHE_REAL_KEY=${{ env.CCACHE_KEY }}-none
           fi
           if [[ "${{ inputs.ksu_type }}" == "sukisu" && "${{ inputs.susfs_enable }}" == "true" ]]; then
-            CCACHE_REAL_KEY+="-sukisu-susfs-56d45a1-5f236a7-v1"
+            KSU_CACHE_REF="${{ inputs.ksu_branch_or_hash }}"
+            [[ -n "$KSU_CACHE_REF" ]] || KSU_CACHE_REF="default"
+            KSU_CACHE_REF="${KSU_CACHE_REF//[^[:alnum:]_-]/-}"
+            CCACHE_REAL_KEY+="-sukisu-${KSU_CACHE_REF}-susfs-${SUSFS_COMMIT:0:7}-v1"
           fi
           echo "CCACHE_REAL_KEY=$CCACHE_REAL_KEY" >> $GITHUB_ENV
 
@@ -268,16 +276,72 @@ jobs:
 
       - name: 添加KernelSU
         id: ksu_version
+        env:
+          KSU_BRANCH_OR_HASH: ${{ inputs.ksu_branch_or_hash }}
         run: |
+          set -euo pipefail
           # 进入内核工作目录
           cd kernel_workspace
+          checkout_ksu_ref() {
+            local repository="$1" default_ref="$2" requested_ref="$KSU_BRANCH_OR_HASH"
+            local commit_sha ref_kind
+            if [[ -z "$requested_ref" ]]; then
+              requested_ref="$default_ref"
+            fi
+            if [[ "$requested_ref" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              echo "Checking out exact KSU commit $requested_ref"
+              git -C "$repository" fetch --depth=1 origin "$requested_ref"
+              git -C "$repository" checkout --detach FETCH_HEAD
+              commit_sha="$(git -C "$repository" rev-parse HEAD)"
+              if [[ "${commit_sha,,}" != "${requested_ref,,}" ]]; then
+                echo "::error::KSU checkout mismatch: requested $requested_ref, got $commit_sha"
+                exit 1
+              fi
+              ref_kind="commit"
+            else
+              if ! git check-ref-format "refs/tags/$requested_ref" >/dev/null \
+                && ! git check-ref-format --branch "$requested_ref" >/dev/null; then
+                echo "::error::ksu_branch_or_hash must be a branch, tag, or full 40-character commit SHA"
+                exit 1
+              fi
+              if git -C "$repository" fetch --depth=1 origin "refs/tags/$requested_ref"; then
+                echo "Checking out KSU tag $requested_ref"
+                git -C "$repository" checkout --detach FETCH_HEAD
+                ref_kind="tag"
+              elif git -C "$repository" fetch --depth=1 origin "refs/heads/$requested_ref"; then
+                echo "Checking out KSU branch $requested_ref"
+                git -C "$repository" checkout -B "$requested_ref" FETCH_HEAD
+                [[ "$(git -C "$repository" branch --show-current)" == "$requested_ref" ]] \
+                  || { echo "::error::KSU branch checkout mismatch for $requested_ref"; exit 1; }
+                ref_kind="branch"
+              else
+                echo "::error::KSU ref not found as a tag or branch: $requested_ref"
+                exit 1
+              fi
+              commit_sha="$(git -C "$repository" rev-parse HEAD)"
+            fi
+            KSU_COMMIT_SHA="$commit_sha"
+            echo "KSU_COMMIT_SHA=$commit_sha" >> "$GITHUB_ENV"
+            echo "KSU $ref_kind '$requested_ref' resolved to $commit_sha"
+          }
+          if [[ -n "$KSU_BRANCH_OR_HASH" && "${{ inputs.ksu_type }}" == "none" ]]; then
+            echo "::error::ksu_branch_or_hash cannot be used when ksu_type is none"
+            exit 1
+          fi
+          if [[ -n "$KSU_BRANCH_OR_HASH" && ! "$KSU_BRANCH_OR_HASH" =~ ^[0-9a-fA-F]{40}$ ]] \
+            && ! git check-ref-format --branch "$KSU_BRANCH_OR_HASH" >/dev/null \
+            && ! git check-ref-format "refs/tags/$KSU_BRANCH_OR_HASH" >/dev/null; then
+            echo "::error::ksu_branch_or_hash must be a branch, tag, or full 40-character commit SHA"
+            exit 1
+          fi
           if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" ]]; then
             echo "正在配置SukiSU Ultra..."
+            SUKISU_SETUP_REF="${KSU_BRANCH_OR_HASH:-main}"
             SUKISU_SETUP_SCRIPT="$(mktemp /tmp/sukisu_setup_XXXXXX.sh)"
             trap 'rm -f "$SUKISU_SETUP_SCRIPT"' EXIT
             if ! curl --fail --location --proto '=https' --tlsv1.2 -LSs \
               --retry 5 --retry-delay 5 --retry-all-errors \
-              "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
+              "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/${SUKISU_SETUP_REF}/kernel/setup.sh" \
               -o "$SUKISU_SETUP_SCRIPT"; then
               echo "::error::Failed to download SukiSU Ultra setup.sh"
               exit 1
@@ -287,8 +351,9 @@ jobs:
               echo "::error::Downloaded SukiSU setup.sh is invalid (${SCRIPT_SIZE} bytes)"
               exit 1
             fi
-            bash "$SUKISU_SETUP_SCRIPT" main
+            bash "$SUKISU_SETUP_SCRIPT" "$SUKISU_SETUP_REF"
             KSU_REPO_DIR="$(pwd)/KernelSU"
+            checkout_ksu_ref "$KSU_REPO_DIR" main
             KSU_KDIR="$KSU_REPO_DIR/kernel"
             [[ -d "$KSU_KDIR" ]] || { echo "::error::SukiSU setup did not create KernelSU/kernel"; exit 1; }
             [[ -f "$KSU_KDIR/Kbuild" ]] || { echo "::error::SukiSU Kbuild file missing"; exit 1; }
@@ -322,7 +387,6 @@ jobs:
             done < <(grep -rlwE 'allow_shell|ksu_late_loaded|ksu_no_custom_rc' "$KSU_KDIR" --include='*.c' 2>/dev/null || true)
             fi
 
-            KSU_COMMIT_SHA="$(git -C "$KSU_REPO_DIR" rev-parse HEAD)"
             COMMITS_COUNT="$(git -C "$KSU_REPO_DIR" rev-list --count HEAD)"
             KSU_VERSION=$((COMMITS_COUNT + 37185))
             if [[ "${{ inputs.susfs_enable }}" != "true" ]]; then
@@ -350,19 +414,23 @@ jobs:
           elif [[ ${{ github.event.inputs.ksu_type }} == "bakasu" ]]; then
             echo "正在配置BakaSU..."
             curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/refs/heads/main/kernel/setup.sh" | bash -s main
+            KSU_REPO_DIR="$(pwd)/KernelSU"
+            checkout_ksu_ref "$KSU_REPO_DIR" main
             echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@cctv18"' >> ./common/arch/arm64/configs/gki_defconfig
             cd ./KernelSU
             # 生成自定义版本号（基于提交计数）, 失败时使用 114514
-            KSU_VERSION=$(expr $(git rev-list --count main) + 30700 2>/dev/null || echo 114514)
+            KSU_VERSION=$(expr $(git rev-list --count HEAD) + 30700 2>/dev/null || echo 114514)
             # 存储版本号到 GitHub 环境变量
             echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
             echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
           elif [[ ${{ github.event.inputs.ksu_type }} == "ksunext" ]]; then
             echo "正在配置KernelSU Next..."
             curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
+            KSU_REPO_DIR="$(pwd)/KernelSU-Next"
+            checkout_ksu_ref "$KSU_REPO_DIR" dev-susfs
             cd KernelSU-Next
+            KSU_VERSION=$(expr $(git rev-list --count HEAD) + 30000)
             rm -rf .git
-            KSU_VERSION=$(expr $(curl -sI "https://api.github.com/repos/pershoot/KernelSU-Next/commits?sha=dev&per_page=1" | grep -i "link:" | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p') "+" 30000)
             echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
             echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
             sed -i "s/KSU_VERSION_FALLBACK := 1/KSU_VERSION_FALLBACK := $KSU_VERSION/g" kernel/Kbuild
@@ -375,8 +443,10 @@ jobs:
           elif [[ ${{ github.event.inputs.ksu_type }} == "ksu" ]]; then
             echo "正在配置原版 KernelSU (tiann/KernelSU)..."
             curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/refs/heads/main/kernel/setup.sh" | bash -s main
+            KSU_REPO_DIR="$(pwd)/KernelSU"
+            checkout_ksu_ref "$KSU_REPO_DIR" main
             cd ./KernelSU
-            KSU_VERSION=$(expr $(curl -sI "https://api.github.com/repos/tiann/KernelSU/commits?sha=main&per_page=1" | grep -i "link:" | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p') "+" 30000)
+            KSU_VERSION=$(expr $(git rev-list --count HEAD) + 30000)
             echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
             echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
             sed -i "s/DKSU_VERSION=16/DKSU_VERSION=${KSU_VERSION}/" kernel/Kbuild
