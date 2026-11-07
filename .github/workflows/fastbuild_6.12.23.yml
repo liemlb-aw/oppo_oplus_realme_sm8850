@@ -29,7 +29,7 @@ on:
         description: 'KSU branch, tag, or full 40-character commit SHA (empty = default branch for selected type)'
         required: false
         type: string
-        default: ""
+        default: "v4.3.0-r2"
       susfs_enable:
         description: '是否开启susfs(用于增强隐藏环境挂载功能; 可能轻微增加耗电，上游更新导致不稳定时或不需要可关闭)'
         required: true
@@ -54,7 +54,7 @@ on:
         description: "是否启用bbr算法(优化上行数据,对手机日用无太大意义甚至可能负优化;false关闭,true仅加入算法,default启用算法并设为默认)"
         required: true
         type: choice
-        default: 'false'
+        default: 'true'
         options:
           - 'false'
           - 'true'
@@ -679,7 +679,7 @@ jobs:
             echo "CONFIG_IPC_NS=y" >> ./arch/arm64/configs/gki_defconfig
             echo "CONFIG_USER_NS=y" >> ./arch/arm64/configs/gki_defconfig
             echo "CONFIG_NET_NS=y" >> ./arch/arm64/configs/gki_defconfig
-            echo "CONFIG_UTS_NS=y" >> ./arch/arm64/configs/gki_defconfig
+            # echo "CONFIG_UTS_NS=y" >> ./arch/arm64/configs/gki_defconfig
             echo "CONFIG_SYSVIPC=y" >> ./arch/arm64/configs/gki_defconfig
             # echo "CONFIG_DEVTMPFS=y" >> ./arch/arm64/configs/gki_defconfig
             echo "CONFIG_NAMESPACES=y" >> ./arch/arm64/configs/gki_defconfig
@@ -691,10 +691,10 @@ jobs:
             echo "CONFIG_TMPFS_POSIX_ACL=y" >> ./arch/arm64/configs/gki_defconfig
             echo "CONFIG_TMPFS_XATTR=y" >> ./arch/arm64/configs/gki_defconfig
             # 未经测试的配置选项，可能导致bug
-            echo "CONFIG_CGROUP_DEVICE=y" >> ./arch/arm64/configs/gki_defconfig
-            echo "CONFIG_CGROUP_PIDS=y" >> ./arch/arm64/configs/gki_defconfig
+            # echo "CONFIG_CGROUP_DEVICE=y" >> ./arch/arm64/configs/gki_defconfig
+            # echo "CONFIG_CGROUP_PIDS=y" >> ./arch/arm64/configs/gki_defconfig
             # echo "CONFIG_CGROUP_SCHED=y" >> ./arch/arm64/configs/gki_defconfig
-            echo "CONFIG_CGROUP_FREEZER=y" >> ./arch/arm64/configs/gki_defconfig
+            # echo "CONFIG_CGROUP_FREEZER=y" >> ./arch/arm64/configs/gki_defconfig
             echo "CONFIG_CGROUP_NET_PRIO=y" >> ./arch/arm64/configs/gki_defconfig
             echo "CONFIG_CGROUP_BPF=y" >> ./arch/arm64/configs/gki_defconfig
             # echo "CONFIG_CGROUPS=y" >> ./arch/arm64/configs/gki_defconfig
