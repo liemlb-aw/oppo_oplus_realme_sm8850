@@ -534,7 +534,7 @@ index 7e337abff786f727772106fb4d0fbc2191a611cf..8b6e0b3cb6d7cd1c8f85d746774178d9
      pr_info("handle umount for uid: %d, pid: %d\n", new_uid, current->pid);
  
 diff --git a/kernel/feature/selinux_hide.c b/kernel/feature/selinux_hide.c
-index 2a41b8056d6e2e0a416d37e9fd984b4e7852070a..a33921a736130e2cbb4efa768d76e64bc98637f2 100644
+index 385b415a0ee7b39c1a94567c504cd0cbada9c0fb..a33921a736130e2cbb4efa768d76e64bc98637f2 100644
 --- a/kernel/feature/selinux_hide.c
 +++ b/kernel/feature/selinux_hide.c
 @@ -1,505 +1,76 @@
@@ -804,8 +804,8 @@ index 2a41b8056d6e2e0a416d37e9fd984b4e7852070a..a33921a736130e2cbb4efa768d76e64b
 -    if (error)
 -        return error;
 -
--    /* Obtain a SID for the context, if one was specified. */
--    if (size && str[0] && str[0] != '\n') {
+-    /* Keep every non-empty value on the backup validation path */
+-    if (size && str[0]) {
 -        if (str[size - 1] == '\n') {
 -            str[size - 1] = 0;
 -            size--;
@@ -1084,7 +1084,8 @@ index 2a41b8056d6e2e0a416d37e9fd984b4e7852070a..a33921a736130e2cbb4efa768d76e64b
  };
  
 -void ksu_selinux_hide_handle_second_stage()
--{
++void __init ksu_selinux_hide_init(void)
+ {
 -    initialize_fake_status();
 -    // https://github.com/torvalds/linux/blame/e8c2f9fdadee7cbc75134dc463c1e0d856d6e5c7/security/selinux/selinuxfs.c#L2014
 -    if (fake_status) {
@@ -1125,8 +1126,7 @@ index 2a41b8056d6e2e0a416d37e9fd984b4e7852070a..a33921a736130e2cbb4efa768d76e64b
 -}
 -
 -void __init ksu_selinux_hide_init()
-+void __init ksu_selinux_hide_init(void)
- {
+-{
 -    if (ksu_register_feature_handler(&selinux_hide_handler)) {
 +    if (ksu_register_feature_handler(&selinux_hide_handler))
          pr_err("Failed to register selinux_hide feature handler\n");
@@ -1165,7 +1165,7 @@ index 2a41b8056d6e2e0a416d37e9fd984b4e7852070a..a33921a736130e2cbb4efa768d76e64b
          sidtab_destroy(backup_sepolicy->sidtab);
          kfree(backup_sepolicy->sidtab);
          ksu_destroy_sepolicy(backup_sepolicy);
-@@ -593,676 +113,3 @@ void ksu_selinux_hide_drop_backup_if_unused()
+@@ -593,692 +113,3 @@ void ksu_selinux_hide_drop_backup_if_unused()
      }
      mutex_unlock(&selinux_hide_mutex);
  }
@@ -1175,14 +1175,17 @@ index 2a41b8056d6e2e0a416d37e9fd984b4e7852070a..a33921a736130e2cbb4efa768d76e64b
 - */
 -static int string_to_context_struct(struct policydb *pol, struct policydb *orig_pol, struct sidtab *sidtabp,
 -                                    struct sidtab *orig_sidtabp, char *scontext, const char *source, u32 source_len,
--                                    struct context *ctx, struct context *orig_ctx, u32 def_sid, int *orig_rc_p)
+-                                    struct context *ctx, struct context *orig_ctx, u32 policy_generation, u32 def_sid,
+-                                    int *orig_rc_p)
 -{
 -    struct role_datum *role, *orig_role;
 -    struct type_datum *typdatum, *orig_typdatum;
 -    struct user_datum *usrdatum, *orig_usrdatum;
 -    char *scontextp, *p, oldc;
 -    bool orig_valid = true;
+-    bool live_valid = true;
 -    int rc = -EINVAL, orig_rc = -EINVAL;
+-    int type_is_original;
 -
 -    context_init(ctx);
 -    context_init(orig_ctx);
@@ -1203,10 +1206,10 @@ index 2a41b8056d6e2e0a416d37e9fd984b4e7852070a..a33921a736130e2cbb4efa768d76e64b
 -
 -    usrdatum = symtab_search(&pol->p_users, scontextp);
 -    orig_usrdatum = symtab_search(&orig_pol->p_users, scontextp);
--    if (!usrdatum)
--        goto out;
--
--    ctx->user = usrdatum->value;
+-    if (usrdatum)
+-        ctx->user = usrdatum->value;
+-    else
+-        live_valid = false;
 -    if (orig_usrdatum)
 -        orig_ctx->user = orig_usrdatum->value;
 -    else
@@ -1224,9 +1227,10 @@ index 2a41b8056d6e2e0a416d37e9fd984b4e7852070a..a33921a736130e2cbb4efa768d76e64b
 -
 -    role = symtab_search(&pol->p_roles, scontextp);
 -    orig_role = symtab_search(&orig_pol->p_roles, scontextp);
--    if (!role)
--        goto out;
--    ctx->role = role->value;
+-    if (role)
+-        ctx->role = role->value;
+-    else
+-        live_valid = false;
 -    if (orig_role)
 -        orig_ctx->role = orig_role->value;
 -    else
@@ -1240,15 +1244,27 @@ index 2a41b8056d6e2e0a416d37e9fd984b4e7852070a..a33921a736130e2cbb4efa768d76e64b
 -    *p++ = 0;
 -
 -    typdatum = symtab_search(&pol->p_types, scontextp);
--    orig_typdatum = symtab_search(&orig_pol->p_types, scontextp);
--    if (!typdatum || typdatum->attribute)
--        goto out;
+-    if (!typdatum || typdatum->attribute) {
+-        live_valid = false;
+-    } else {
+-        ctx->type = typdatum->value;
+-        // Type values stay stable when KSU copies the live policy
+-        type_is_original = ksu_type_is_original(orig_pol, policy_generation, typdatum->value);
+-        if (type_is_original < 0) {
+-            orig_typdatum = symtab_search(&orig_pol->p_types, scontextp);
+-            if (orig_typdatum && !orig_typdatum->attribute)
+-                orig_ctx->type = orig_typdatum->value;
+-            else
+-                orig_valid = false;
+-        } else if (type_is_original) {
+-            orig_ctx->type = typdatum->value;
+-        } else {
+-            orig_valid = false;
+-        }
+-    }
 -
--    ctx->type = typdatum->value;
--    if (orig_typdatum && !orig_typdatum->attribute)
--        orig_ctx->type = orig_typdatum->value;
--    else
--        orig_valid = false;
+-    if (!live_valid)
+-        goto out;
 -
 -    rc = mls_context_to_sid(pol, oldc, p, ctx, sidtabp, def_sid);
 -    if (orig_valid) {
@@ -1316,7 +1332,7 @@ index 2a41b8056d6e2e0a416d37e9fd984b4e7852070a..a33921a736130e2cbb4efa768d76e64b
 -    // parse both policies together
 -    orig_rc = -EINVAL;
 -    rc = string_to_context_struct(policydb, orig_policydb, sidtab, orig_sidtab, scontext2, scontext, scontext_len,
--                                  &context, &orig_context, def_sid, &orig_rc);
+-                                  &context, &orig_context, orig_policy->latest_granting, def_sid, &orig_rc);
 -    if (rc)
 -        goto out_unlock;
 -
@@ -2997,10 +3013,10 @@ index 90d14912cd09b3fd9da881b55117d5b7712ec8e5..e0116d95bcfb71e537f2279184595744
          free_module_rc();
      }
 diff --git a/kernel/selinux/rules.c b/kernel/selinux/rules.c
-index 241eeeb0ebc73e16eb941a0c29359ee5c5de2466..a85c04df864fdce721f60cfc6eb86d4226fa8958 100644
+index 587f9306506d6ab0ca729cef1dbce8f0502eb41a..cefde809f7ae5d895281e02dfe318c40b0de068a 100644
 --- a/kernel/selinux/rules.c
 +++ b/kernel/selinux/rules.c
-@@ -162,6 +162,7 @@ void apply_kernelsu_rules()
+@@ -165,6 +165,7 @@ void apply_kernelsu_rules()
      ksu_destroy_sepolicy(old_pol);
  
      reset_avc_cache(pol->latest_granting);
